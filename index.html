@@ -102,12 +102,8 @@ const num=v=>{if(typeof v=='number')return v;if(v==null||String(v).trim()==='')r
  s=/,\d{1,4}$/.test(s)?s.replace(/\./g,'').replace(',','.'):s.replace(/,/g,'');return /^-?\d*\.?\d+$/.test(s)?parseFloat(s):NaN};
 const mk=(u,occ)=>{const k=u.toLowerCase().replace(/\s+/g,' ');occ[k]=(occ[k]||0)+1;return k+'#'+occ[k]};
 const lvl=no=>/^[IVX]+$/.test(no)?1:/^[A-Z]$/.test(no)?2:3;
-async function parse(f,mode){
- if(!/\.xlsx?$/i.test(f.name))throw Error('Format file harus .xlsx atau .xls.');
- let aoa;try{const wb=XLSX.read(await f.arrayBuffer(),{type:'array'});aoa=XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{header:1,defval:null})}
- catch(x){throw Error('File Excel rusak atau tidak bisa dibaca: '+x.message)}
- const h=aoa.findIndex((r,i)=>i<25&&r.some(c=>/uraian/i.test(c??'')));
- if(h<0)throw Error('Baris header tidak ditemukan. Sheet pertama harus punya kolom "Uraian".');
+const sheetMap=aoa=>{
+ const h=aoa.findIndex((r,i)=>i<25&&r.some(c=>/uraian/i.test(c??'')));if(h<0)return null;
  const hd=[h];for(let k=1;k<3;k++){const r=aoa[h+k];if(r&&!r.some(c=>typeof c=='number')&&r.filter(c=>c!=null).length>=2&&r.every(c=>c==null||String(c).length<26))hd.push(h+k);else break}
  const W=Math.max(...hd.map(i=>aoa[i].length)),col={};
  for(let c=0;c<W;c++){const t=hd.map(i=>aoa[i][c]??'').join(' ').toLowerCase(),bob=/bobot/.test(t);let k;
@@ -115,20 +111,29 @@ async function parse(f,mode){
   if(/uraian/.test(t))k='u';else if(/kumulatif|s\/?d\.? ?(minggu )?ini/.test(t))k=bob?0:'kum';else if(/minggu ini|mg\.? ?ini/.test(t))k=bob?0:'ini';
   else if(bob)k='b';else if(/^\s*(no|kode)/.test(t))k='no';else if(/\bsat/.test(t))k='s';else if(/vol/.test(t))k='v';
   if(k&&!(k in col))col[k]=c}
- const need=mode=='rab'?['v','b']:[],miss=need.filter(k=>!(k in col));
- if(mode=='rab'&&miss.length)throw Error('Kolom wajib RAB tidak ditemukan: Volume dan Bobot %.');
- if(mode=='prog'&&!('ini' in col)&&!('kum' in col))throw Error('Kolom progres tidak ditemukan: butuh "Minggu ini" (volume) atau "S/d minggu ini"/"Kumulatif".');
+ return{h,hd,col}};
+async function parse(f,mode){
+ if(!/\.xlsx?$/i.test(f.name))throw Error('Format file harus .xlsx atau .xls.');
+ let wb;try{wb=XLSX.read(await f.arrayBuffer(),{type:'array'})}catch(x){throw Error('File Excel rusak atau tidak bisa dibaca: '+x.message)}
+ const pref=n=>/mingguan|rab|progres|laporan/i.test(n)?0:1;
+ let pk=null;
+ for(const n of wb.SheetNames.slice().sort((a,b)=>pref(a)-pref(b))){
+  const aoa=XLSX.utils.sheet_to_json(wb.Sheets[n],{header:1,defval:null}),m=sheetMap(aoa);
+  if(m&&(mode=='rab'?('v' in m.col&&'b' in m.col):('ini' in m.col||'kum' in m.col))){pk={aoa,sheet:n,...m};break}}
+ if(!pk)throw Error(`Tidak ada sheet yang cocok untuk ${mode=='rab'?'RAB (kolom Uraian, Volume, Bobot %)':'progres (kolom Uraian dan Minggu ini / S/d minggu ini)'}. Sheet di file: ${wb.SheetNames.join(', ')}.`);
+ const{aoa,h,hd,col,sheet}=pk;
  const rows=[],errors=[],warns=[],occ={},L=new Map(mode=='prog'?calc().rows.filter(r=>r.id).map(r=>[r.id,r.l]):[]),
   byKey=new Map(items.filter(i=>i.tipe=='i').map(i=>[i.key,i])),seen=new Set(),st=h+hd.length;
- aoa.slice(st).forEach((r,i)=>{const ln=st+i+1,u=String(r[col.u]??'').trim();
+ aoa.slice(st).forEach((r,i)=>{const ln=st+i+1,ue=Math.min(...['s','v','b','ini','kum'].filter(k=>k in col).map(k=>col[k])),u=String(r.slice(col.u,Math.max(ue,col.u+1)).find(c=>c!=null&&String(c).trim()!=='')??'').trim();
   if(!u||/^(jumlah|total)\b/i.test(u))return;
   const g=k=>k in col?num(r[col[k]]):NaN,v=g('v'),b=g('b'),ini=g('ini'),kum=g('kum'),s=String(r[col.s]??'').trim(),no=String(r[col.no]??'').trim();
   for(const k of ['v','b','ini','kum'])if(k in col&&r[col[k]]!=null&&String(r[col[k]]).trim()!==''&&isNaN(g(k)))errors.push(`Baris ${ln}: kolom ${k} berisi teks non-angka ("${r[col[k]]}")`);
-  const isItem=[v,ini,kum].some(x=>!isNaN(x))||s;
+  const isItem=[v,b,ini,kum].some(x=>!isNaN(x));
   if(mode=='rab'){
    if(!isItem)return rows.push({tipe:'h',no,uraian:u,level:lvl(no)});
-   if(isNaN(v)||v<0)errors.push(`Baris ${ln}: volume kontrak wajib angka ≥ 0`);
-   if(isNaN(b)||b<0)errors.push(`Baris ${ln}: bobot % wajib angka ≥ 0`);
+   if(v<0||b<0)errors.push(`Baris ${ln}: volume/bobot tidak boleh negatif`);
+   if(isNaN(v)||isNaN(b))warns.push(`Baris ${ln}: ${isNaN(v)?'volume':'bobot'} kosong, dianggap 0`);
+   if(!(v>0)&&b>0)errors.push(`Baris ${ln}: bobot ${N(b,4)}% tetapi volume kosong/0 ("${u}")`);
    return rows.push({tipe:'i',no,uraian:u,sat:s,vol:v||0,bobot:b||0,key:mk(u,occ)})}
   if(!isItem)return;
   const it=byKey.get(mk(u,occ));
@@ -142,13 +147,13 @@ async function parse(f,mode){
  if(mode=='rab'){const s=rows.reduce((a,r)=>a+(r.bobot||0),0);if(Math.abs(s-100)>1)warns.push(`Total bobot ${N(s,4)}% (seharusnya ±100%)`)}
  else if(!byKey.size)errors.push('Proyek belum punya RAB. Impor RAB lebih dulu.');
  else if(seen.size<byKey.size)warns.push(`${byKey.size-seen.size} pekerjaan RAB tidak ada di file (dianggap tidak berubah)`);
- return{mode,file:f.name,rows,errors,warns,ok:!errors.length}}
+ return{mode,file:f.name,sheet,rows,errors,warns,ok:!errors.length}}
 
 $('#fx').onchange=async e=>{const f=e.target.files[0];e.target.value='';if(!f||!proj)return;
  try{pend=await parse(f,$('#mode').value)}catch(x){pend={errors:[x.message],warns:[],rows:[],ok:false}}drawImp();if(pend.ok&&pend.mode=='prog')await apply()};
-function drawImp(){const p=pend;$('#imp').innerHTML=!p?'':`<div class="imp"><b class="${p.ok?'ok':'err'}">${p.ok?`Siap disimpan: ${p.rows.length} baris`:`Gagal: ${p.errors.length} masalah, tidak ada data yang disimpan`}</b>
+function drawImp(){const p=pend;$('#imp').innerHTML=!p?'':`<div class="imp"><b class="${p.ok?'ok':'err'}">${p.ok?`Siap disimpan: ${p.rows.length} baris (sheet ${esc(p.sheet)})`:`Gagal: ${p.errors.length} masalah, tidak ada data yang disimpan`}</b>
  ${p.errors.length?`<ul class="err">${p.errors.slice(0,15).map(x=>`<li>${esc(x)}</li>`).join('')}${p.errors.length>15?`<li>… +${p.errors.length-15} lagi</li>`:''}</ul>`:''}
- ${p.warns.length?`<ul>${p.warns.slice(0,8).map(x=>`<li>${esc(x)}</li>`).join('')}</ul>`:''}
+ ${p.warns.length?`<ul>${p.warns.slice(0,8).map(x=>`<li>${esc(x)}</li>`).join('')}${p.warns.length>8?`<li>… +${p.warns.length-8} peringatan lagi</li>`:''}</ul>`:''}
  <button class="btn" id="ok" ${p.ok?'':'disabled'}>Simpan ke ${p.mode=='rab'?'RAB':'minggu '+proj.mingguAktif}</button> <button class="btn sec" id="no">Batal</button></div>`;
  if(p){$('#no').onclick=()=>{pend=null;drawImp()};$('#ok').onclick=apply}}
 async function apply(){const p=pend;if(!p?.ok)return;
@@ -195,17 +200,4 @@ function drawWork(){const c=proj.mingguAktif,{rows,T}=calc(),d=rows.filter(r=>r.
  $('#ws').textContent=`Minggu ke-${c}: progres ${N(T.ini,4)}% (kumulatif ${N(T.kum,4)}%), ${d.length} pekerjaan`;
  $('#tw').innerHTML=d.length?'<tr><th>No</th><th>Pekerjaan minggu ini</th><th>Sat</th><th>Volume</th><th>Bobot %</th><th>Selesai</th></tr>'+d.map(r=>`<tr><td>${esc(r.no)}</td><td>${esc(r.uraian)}</td><td>${esc(r.sat)}</td><td class="r">${N(r.i,4)}</td><td class="r">${N(r.bi,4)}</td><td class="r">${r.vol?N(r.k/r.vol*100,0)+'%':''}</td></tr>`).join(''):'<tr><td>Belum ada progres minggu ini. Unggah Excel progres atau isi volume manual.</td></tr>'}
 function drawLog(){$('#tl').innerHTML='<tr><th>Minggu</th><th>Periode</th><th>Status</th><th>Lalu %</th><th>Minggu ini %</th><th>Kumulatif %</th><th>Bayar minggu (Rp)</th><th>Kumulatif (Rp)</th></tr>'+
- history().map(h=>`<tr><td>${h.n}</td><td>${esc(h.w.dari)} s/d ${esc(h.w.sampai)}</td><td>${h.w.status=='closed'?'Ditutup':'Berjalan'}</td><td class="r">${N(h.lalu,4)}</td><td class="r">${N(h.ini,4)}</td><td class="r">${N(h.cum,4)}</td><td class="r">${N(h.bayar,0)}</td><td class="r">${N(h.kumBayar,0)}</td></tr>`).join('')}
-
-/* input volume minggu ini: simpan per-item (field path), tanpa menimpa minggu lain */
-$('#tp').oninput=e=>{const id=e.target.dataset.id,w=weeks[proj?.mingguAktif];if(!id||!w)return;
- const v=Math.max(0,parseFloat(e.target.value)||0);(w.progress??={})[id]=v;
- const{rows,T}=calc(),r=rows.find(x=>x.id==id),tr=e.target.closest('tr');tr.className=r.err?'bad':'';
- [r.k,r.bl,r.bi,r.bk].forEach((x,j)=>tr.querySelector(`[data-o="${j}"]`).textContent=N(x,4));sum(T);drawWork();
- clearTimeout(tm[id]);tm[id]=setTimeout(()=>updateDoc(wref(),{['progress.'+id]:v}).catch(fail),500)};
-$('#f').oninput=e=>{const k=e.target.dataset.k;if(!k||!proj)return;const v=e.target.type=='number'?+e.target.value||0:e.target.value;
- clearTimeout(tm[k]);tm[k]=setTimeout(()=>updateDoc(pref(),{[k]:v}).catch(fail),600)};
-['dr','sp'].forEach(i=>$('#'+i).onchange=e=>proj&&updateDoc(wref(),{[i=='dr'?'dari':'sampai']:e.target.value}).catch(fail));
-$('#tabs').onclick=e=>{const v=e.target.dataset.v;if(!v)return;document.querySelectorAll('.tabs button,.view').forEach(x=>x.classList.remove('on'));e.target.classList.add('on');$('#v-'+v).classList.add('on')};
-render();
-</script></body></html>
+ history().map(h=>`<tr><td>${h.n}</td><td>${esc(h.w.dari)} s/d ${esc(h.w.sampai)}</td><td>${h.w.status=='closed'?'Ditutup':'Berjalan'}</td><td class="r">${N(h.lalu,4)}</td><td class="r">${N(
