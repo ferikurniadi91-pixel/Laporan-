@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="id"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Dashboard Laporan Mingguan</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<!--
+STRUKTUR FIRESTORE (log historis, tidak ada data yang ditimpa antar minggu)
+projects/{pid}                 nama, kegiatan, lokasi, kontrak, pengawas, pemilik, mandor, nilaiMandor, mingguAktif, createdAt
+projects/{pid}/items/{iNNNN}   urut, tipe('h'|'i'), no, uraian, sat, vol (kontrak), bobot (%), key   <- master RAB, terkunci setelah ada progres
+projects/{pid}/weeks/{n}       minggu, dari, sampai, status('open'|'closed'), progress{itemId: volume minggu itu}, total{lalu,ini,kum}, sumberExcel
+Minggu lalu = jumlah progress minggu < n | Minggu ini = progress minggu n | Kumulatif = lalu + ini
+
+RULES (Firestore > Rules) - ganti dengan Auth sebelum produksi:
+rules_version='2'; service cloud.firestore { match /databases/{db}/documents {
+  match /projects/{p=**} { allow read, write: if request.auth != null; } } }
+-->
+<style>
+:root{--ink:#1c2430;--mut:#5d6672;--line:#cfd4da;--bg:#e6e9ed;--ac:#0e5a63;--err:#b3261e;--ok:#1e7a46}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.4 Tahoma,Verdana,sans-serif}
+header{display:flex;gap:8px;align-items:center;padding:10px 14px;background:var(--ink);color:#fff}header b{flex:1}header select{width:auto;max-width:50vw}
+button{font:inherit;cursor:pointer}.btn{background:var(--ac);color:#fff;border:0;border-radius:6px;padding:8px 14px;font-weight:bold}.btn.sec{background:#fff;color:var(--ink);border:1px solid var(--line)}.btn:disabled{opacity:.5}
+.tabs{display:flex;background:#fff;border-bottom:1px solid var(--line)}.tabs button{flex:1;padding:11px;border:0;background:none;border-bottom:3px solid transparent;color:var(--mut)}.tabs button.on{color:var(--ac);border-color:var(--ac);font-weight:bold}
+main{padding:12px;max-width:1180px;margin:auto}.view{display:none}.view.on{display:block}
+.card{background:#fff;border:1px solid var(--line);border-radius:8px;padding:12px;margin-bottom:12px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}
+label{display:block;font-size:12px;color:var(--mut)}input,select{width:100%;font:inherit;padding:7px;border:1px solid var(--line);border-radius:5px;background:#fff;color:var(--ink)}
+.bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px}.bar input,.bar select{width:auto}
+.sc{overflow:auto;max-height:65vh}table{border-collapse:collapse;min-width:100%}td,th{padding:3px 5px;border-bottom:1px solid var(--line);font-size:12px;text-align:left}th{position:sticky;top:0;background:#fff}
+td input{min-width:76px;padding:4px}.r{text-align:right}.h td{background:#e4e8ec;font-weight:bold}.bad td{background:#fdecea}.tot td{font-weight:bold;background:#eef1f4}
+.kpi{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px}.kpi div{background:#eef1f4;border-radius:6px;padding:8px;font-size:12px}.kpi b{display:block;font-size:17px}
+.err{color:var(--err)}.ok{color:var(--ok)}.imp{border:1px solid var(--line);border-radius:6px;padding:8px;margin-bottom:8px}.imp ul{margin:4px 0;padding-left:18px;font-size:12px}
+</style></head><body>
+<header><b>Laporan Mingguan</b><select id="ps"></select><button class="btn" id="np">+ Proyek</button></header>
+<nav class="tabs" id="tabs"><button data-v="prog" class="on">Progres</button><button data-v="log">Riwayat &amp; bayar</button><button data-v="set">Data proyek</button></nav>
+<main><div id="msg"></div>
+<section class="view on" id="v-prog">
+ <div class="card"><div class="kpi" id="kpi"></div></div>
+ <div class="card"><b id="ws"></b><div class="sc" style="max-height:38vh"><table id="tw"></table></div></div>
+ <div class="card">
+  <div class="bar"><b id="wk"></b><label>Dari <input type="date" id="dr"></label><label>Sampai <input type="date" id="sp"></label></div>
+  <div class="bar"><select id="mode"><option value="prog">Impor progres mingguan</option><option value="rab">Impor RAB (master pekerjaan)</option></select><input type="file" id="fx" accept=".xlsx,.xls"><button class="btn sec" id="tpl">Unduh template</button></div>
+  <div id="imp"></div>
+  <div class="sc"><table id="tp"></table></div>
+  <div class="bar" style="margin-top:8px"><button class="btn" id="cw">Tutup minggu &amp; mulai minggu berikutnya</button></div>
+ </div></section>
+<section class="view" id="v-log"><div class="card"><div class="sc"><table id="tl"></table></div></div></section>
+<section class="view" id="v-set"><div class="card"><div class="grid" id="f"></div></div></section>
+</main>
+<script type="module">
+import {initializeApp} from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+import {getAuth,signInAnonymously} from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+import {getFirestore,collection,doc,onSnapshot,setDoc,updateDoc,writeBatch,query,orderBy,serverTimestamp} from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+
+/* ===== 1. KONFIGURASI FIREBASE: salin dari Console > Project settings > Your apps ===== */
+const CFG={apiKey:"AIzaSyCEAfevr0flgqz1hNPdf5-yVwXi0jdlXhs",authDomain:"laporan-mingguan-871d2.firebaseapp.com",projectId:"laporan-mingguan-871d2",appId:"1:106359828260:web:f643d6146843934766cdb1"};
+
+const $=s=>document.querySelector(s),esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const N=(n,d=2)=>(+n||0).toLocaleString('id-ID',{minimumFractionDigits:d,maximumFractionDigits:d});
+const note=(t,c)=>{$('#msg').innerHTML=t?`<p class="${c||''}">${esc(t)}</p>`:''};
+const addDays=(s,n)=>{const d=new Date(s+'T00:00:00Z');d.setUTCDate(d.getUTCDate()+n);return d.toISOString().slice(0,10)};
+const FIELDS=[['nama','Nama proyek'],['kegiatan','Kegiatan'],['lokasi','Lokasi'],['kontrak','No. kontrak'],['pengawas','Pengawas'],['pemilik','Pemilik'],['mandor','Nama mandor'],['nilaiMandor','Nilai kontrak mandor (Rp)','number']];
+let app,db,projects=[],pid=null,proj=null,items=[],weeks={},unsub=[],pend=null;const tm={};
+try{if(CFG.apiKey.startsWith('ISI'))throw Error('Isi konfigurasi Firebase (CFG) di dalam skrip terlebih dahulu.');app=initializeApp(CFG);db=getFirestore(app)}catch(e){note(e.message,'err')}
+const pref=()=>doc(db,'projects',pid),wref=n=>doc(db,'projects',pid,'weeks',String(n??proj.mingguAktif));
+const fail=e=>note(e.message||String(e),'err');
+
+/* ===== 2. DAFTAR PROYEK DINAMIS (real-time) ===== */
+function start(){onSnapshot(query(collection(db,'projects'),orderBy('createdAt')),s=>{
+ projects=s.docs.map(d=>({id:d.id,...d.data()}));
+ if(!projects.some(p=>p.id==pid)){let last;try{last=localStorage.getItem('pid')}catch{}pick(projects.some(p=>p.id==last)?last:projects[0]?.id)}
+ drawPS()},fail)}
+if(db)signInAnonymously(getAuth(app)).catch(e=>note('Login anonim gagal ('+(e.code||e.message)+'). Aktifkan Authentication > Sign-in method > Anonymous di Firebase Console.','err')).finally(start);
+function pick(id){unsub.forEach(f=>f());unsub=[];pid=id||null;proj=null;items=[];weeks={};
+ if(!id)return render();try{localStorage.setItem('pid',id)}catch{}
+ const pd=pref();
+ unsub=[onSnapshot(pd,s=>{proj=s.exists()?{id,...s.data()}:null;render()},fail),
+  onSnapshot(query(collection(pd,'items'),orderBy('urut')),s=>{items=s.docs.map(d=>({id:d.id,...d.data()}));render()},fail),
+  onSnapshot(collection(pd,'weeks'),s=>{weeks={};s.docs.forEach(d=>weeks[+d.id]=d.data());render()},fail)]}
+function drawPS(){$('#ps').innerHTML=projects.map(p=>`<option value="${p.id}" ${p.id==pid?'selected':''}>${esc(p.nama||'(tanpa nama)')}</option>`).join('')||'<option>Belum ada proyek</option>'}
+$('#ps').onchange=e=>pick(e.target.value);
+$('#np').onclick=async()=>{if(!db)return note('Firebase belum terhubung. Isi CFG di skrip, lalu buka lewat http(s), bukan pratinjau chat.','err');const nama='Proyek '+(projects.length+1);
+ const r=doc(collection(db,'projects')),t=new Date().toISOString().slice(0,10),b=writeBatch(db);
+ b.set(r,{nama,nilaiMandor:0,mingguAktif:1,createdAt:serverTimestamp()});
+ b.set(doc(r,'weeks','1'),{minggu:1,dari:t,sampai:addDays(t,5),status:'open',progress:{}});
+ try{await b.commit();pick(r.id);document.querySelector('[data-v=set]').click();note('Proyek dibuat. Ganti nama dan isi datanya di sini, lalu impor RAB di tab Progres.','ok')}catch(e){fail(e)}};
+
+/* ===== 3. KALKULASI BOBOT: Minggu Lalu / Minggu Ini / Kumulatif ===== */
+function calc(){const cur=proj.mingguAktif,lalu={},ini=weeks[cur]?.progress||{};
+ for(const n in weeks)if(+n<cur)for(const id in weeks[n].progress||{})lalu[id]=(lalu[id]||0)+weeks[n].progress[id];
+ const T={b:0,lalu:0,ini:0,kum:0};
+ const rows=items.map(it=>{if(it.tipe=='h')return it;
+  const l=lalu[it.id]||0,i=ini[it.id]||0,k=l+i,f=it.vol?it.bobot/it.vol:0;
+  const r={...it,l,i,k,bl:l*f,bi:i*f,bk:k*f,err:it.vol>0&&k>it.vol*1.015};
+  T.b+=it.bobot;T.lalu+=r.bl;T.ini+=r.bi;T.kum+=r.bk;return r});
+ return{rows,T}}
+function history(){const M=new Map(items.map(i=>[i.id,i])),NK=+proj.nilaiMandor||0;let cum=0;
+ return Object.keys(weeks).map(Number).sort((a,b)=>a-b).map(n=>{const w=weeks[n];let ini=0;
+  for(const id in w.progress||{}){const it=M.get(id);if(it?.vol)ini+=it.bobot*w.progress[id]/it.vol}
+  const lalu=cum;cum+=ini;return{n,w,lalu,ini,cum,bayar:ini/100*NK,kumBayar:cum/100*NK}})}
+
+/* ===== 4. UPLOAD & PARSE EXCEL (SheetJS) ===== */
+const num=v=>{if(typeof v=='number')return v;if(v==null||String(v).trim()==='')return NaN;let s=String(v).trim().replace(/%/g,'');
+ s=/,\d{1,4}$/.test(s)?s.replace(/\./g,'').replace(',','.'):s.replace(/,/g,'');return /^-?\d*\.?\d+$/.test(s)?parseFloat(s):NaN};
+const mk=(u,occ)=>{const k=u.toLowerCase().replace(/\s+/g,' ');occ[k]=(occ[k]||0)+1;return k+'#'+occ[k]};
+const lvl=no=>/^[IVX]+$/.test(no)?1:/^[A-Z]$/.test(no)?2:3;
+async function parse(f,mode){
+ if(!/\.xlsx?$/i.test(f.name))throw Error('Format file harus .xlsx atau .xls.');
+ let aoa;try{const wb=XLSX.read(await f.arrayBuffer(),{type:'array'});aoa=XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{header:1,defval:null})}
+ catch(x){throw Error('File Excel rusak atau tidak bisa dibaca: '+x.message)}
+ const h=aoa.findIndex((r,i)=>i<25&&r.some(c=>/uraian/i.test(c??'')));
+ if(h<0)throw Error('Baris header tidak ditemukan. Sheet pertama harus punya kolom "Uraian".');
+ const hd=[h];for(let k=1;k<3;k++){const r=aoa[h+k];if(r&&!r.some(c=>typeof c=='number')&&r.filter(c=>c!=null).length>=2&&r.every(c=>c==null||String(c).length<26))hd.push(h+k);else break}
+ const W=Math.max(...hd.map(i=>aoa[i].length)),col={};
+ for(let c=0;c<W;c++){const t=hd.map(i=>aoa[i][c]??'').join(' ').toLowerCase(),bob=/bobot/.test(t);let k;
+  if(/lalu/.test(t))continue;
+  if(/uraian/.test(t))k='u';else if(/kumulatif|s\/?d\.? ?(minggu )?ini/.test(t))k=bob?0:'kum';else if(/minggu ini|mg\.? ?ini/.test(t))k=bob?0:'ini';
+  else if(bob)k='b';else if(/^\s*(no|kode)/.test(t))k='no';else if(/\bsat/.test(t))k='s';else if(/vol/.test(t))k='v';
+  if(k&&!(k in col))col[k]=c}
+ const need=mode=='rab'?['v','b']:[],miss=need.filter(k=>!(k in col));
+ if(mode=='rab'&&miss.length)throw Error('Kolom wajib RAB tidak ditemukan: Volume dan Bobot %.');
+ if(mode=='prog'&&!('ini' in col)&&!('kum' in col))throw Error('Kolom progres tidak ditemukan: butuh "Minggu ini" (volume) atau "S/d minggu ini"/"Kumulatif".');
+ const rows=[],errors=[],warns=[],occ={},L=new Map(mode=='prog'?calc().rows.filter(r=>r.id).map(r=>[r.id,r.l]):[]),
+  byKey=new Map(items.filter(i=>i.tipe=='i').map(i=>[i.key,i])),seen=new Set(),st=h+hd.length;
+ aoa.slice(st).forEach((r,i)=>{const ln=st+i+1,u=String(r[col.u]??'').trim();
+  if(!u||/^(jumlah|total)\b/i.test(u))return;
+  const g=k=>k in col?num(r[col[k]]):NaN,v=g('v'),b=g('b'),ini=g('ini'),kum=g('kum'),s=String(r[col.s]??'').trim(),no=String(r[col.no]??'').trim();
+  for(const k of ['v','b','ini','kum'])if(k in col&&r[col[k]]!=null&&String(r[col[k]]).trim()!==''&&isNaN(g(k)))errors.push(`Baris ${ln}: kolom ${k} berisi teks non-angka ("${r[col[k]]}")`);
+  const isItem=[v,ini,kum].some(x=>!isNaN(x))||s;
+  if(mode=='rab'){
+   if(!isItem)return rows.push({tipe:'h',no,uraian:u,level:lvl(no)});
+   if(isNaN(v)||v<0)errors.push(`Baris ${ln}: volume kontrak wajib angka ≥ 0`);
+   if(isNaN(b)||b<0)errors.push(`Baris ${ln}: bobot % wajib angka ≥ 0`);
+   return rows.push({tipe:'i',no,uraian:u,sat:s,vol:v||0,bobot:b||0,key:mk(u,occ)})}
+  if(!isItem)return;
+  const it=byKey.get(mk(u,occ));
+  if(!it){if(ini>0||kum>0)errors.push(`Baris ${ln}: "${u}" tidak cocok dengan RAB proyek`);return}
+  seen.add(it.id);
+  const val='ini' in col?(isNaN(ini)?0:ini):(isNaN(kum)?0:kum-(L.get(it.id)||0));
+  if(val<-1e-9)return errors.push(`Baris ${ln}: ${'ini' in col?'volume negatif':'kumulatif lebih kecil dari volume minggu lalu'}`);
+  if((L.get(it.id)||0)+val>it.vol*1.015)warns.push(`Baris ${ln}: melebihi volume kontrak`);
+  rows.push({id:it.id,val:Math.max(0,val)})});
+ if(!rows.length)errors.push('Tidak ada baris data yang bisa dibaca.');
+ if(mode=='rab'){const s=rows.reduce((a,r)=>a+(r.bobot||0),0);if(Math.abs(s-100)>1)warns.push(`Total bobot ${N(s,4)}% (seharusnya ±100%)`)}
+ else if(!byKey.size)errors.push('Proyek belum punya RAB. Impor RAB lebih dulu.');
+ else if(seen.size<byKey.size)warns.push(`${byKey.size-seen.size} pekerjaan RAB tidak ada di file (dianggap tidak berubah)`);
+ return{mode,file:f.name,rows,errors,warns,ok:!errors.length}}
+
+$('#fx').onchange=async e=>{const f=e.target.files[0];e.target.value='';if(!f||!proj)return;
+ try{pend=await parse(f,$('#mode').value)}catch(x){pend={errors:[x.message],warns:[],rows:[],ok:false}}drawImp();if(pend.ok&&pend.mode=='prog')await apply()};
+function drawImp(){const p=pend;$('#imp').innerHTML=!p?'':`<div class="imp"><b class="${p.ok?'ok':'err'}">${p.ok?`Siap disimpan: ${p.rows.length} baris`:`Gagal: ${p.errors.length} masalah, tidak ada data yang disimpan`}</b>
+ ${p.errors.length?`<ul class="err">${p.errors.slice(0,15).map(x=>`<li>${esc(x)}</li>`).join('')}${p.errors.length>15?`<li>… +${p.errors.length-15} lagi</li>`:''}</ul>`:''}
+ ${p.warns.length?`<ul>${p.warns.slice(0,8).map(x=>`<li>${esc(x)}</li>`).join('')}</ul>`:''}
+ <button class="btn" id="ok" ${p.ok?'':'disabled'}>Simpan ke ${p.mode=='rab'?'RAB':'minggu '+proj.mingguAktif}</button> <button class="btn sec" id="no">Batal</button></div>`;
+ if(p){$('#no').onclick=()=>{pend=null;drawImp()};$('#ok').onclick=apply}}
+async function apply(){const p=pend;if(!p?.ok)return;
+ try{if(p.mode=='rab'){
+   if(Object.values(weeks).some(w=>Object.keys(w.progress||{}).length))throw Error('RAB terkunci: sudah ada log progres. Buat proyek baru jika RAB berubah.');
+   const ops=[];
+   items.forEach(it=>ops.push(b=>b.delete(doc(db,'projects',pid,'items',it.id))));
+   p.rows.forEach((r,u)=>ops.push(b=>b.set(doc(db,'projects',pid,'items','i'+String(u).padStart(4,'0')),{...r,urut:u})));
+   for(let i=0;i<ops.length;i+=400){const b=writeBatch(db);ops.slice(i,i+400).forEach(o=>o(b));await b.commit()}
+  }else{
+   const map=Object.fromEntries(p.rows.map(r=>[r.id,r.val]));
+   await setDoc(wref(),{progress:map,sumberExcel:p.file,diimporPada:serverTimestamp()},{merge:true})}
+  pend=null;drawImp();note(`Minggu ke-${proj.mingguAktif} tersimpan dari ${p.file}.`+(p.warns.length?` Peringatan: ${p.warns.slice(0,3).join('; ')}`:''),'ok')}catch(e){fail(e)}}
+$('#tpl').onclick=()=>{const wb=XLSX.utils.book_new();
+ XLSX.utils.book_append_sheet(wb,XLSX.utils.aoa_to_sheet([['NO.','URAIAN PEKERJAAN','SAT','VOLUME','BOBOT %','VOLUME MINGGU INI'],['I','PEKERJAAN PENDAHULUAN'],['','Contoh pekerjaan','M2',160,0.5175,25]]),'RAB');
+ XLSX.writeFile(wb,'template-rab-progres.xlsx')};
+
+/* ===== 5. TUTUP MINGGU (atomik: kunci minggu ini, buka minggu berikutnya) ===== */
+$('#cw').onclick=async()=>{const c=proj.mingguAktif,{rows,T}=calc(),w=weeks[c];
+ if(rows.some(r=>r.err)&&!confirm('Ada pekerjaan melebihi volume kontrak >1,5%. Tetap tutup minggu?'))return;
+ if(!confirm(`Tutup minggu ${c}? Datanya dikunci dan minggu ${c+1} dimulai.`))return;
+ const b=writeBatch(db);
+ b.set(wref(c),{status:'closed',closedAt:serverTimestamp(),total:{lalu:T.lalu,ini:T.ini,kum:T.kum}},{merge:true});
+ b.set(wref(c+1),{minggu:c+1,dari:addDays(w.dari,7),sampai:addDays(w.sampai,7),status:'open',progress:{}});
+ b.update(pref(),{mingguAktif:c+1});try{await b.commit()}catch(e){fail(e)}};
+
+/* ===== 6. RENDER ===== */
+const sum=T=>{const NK=+proj.nilaiMandor||0;$('#kpi').innerHTML=[['S/d minggu lalu',N(T.lalu)+'%'],['Minggu ini',N(T.ini)+'%'],['Total kumulatif',N(T.kum)+'%'],['Bayar minggu ini','Rp '+N(T.ini/100*NK,0)]].map(x=>`<div>${x[0]}<b>${x[1]}</b></div>`).join('')};
+function render(){drawPS();
+ if(!proj){$('#tp').innerHTML=$('#tl').innerHTML=$('#kpi').innerHTML='';$('#wk').textContent=db?'Pilih atau buat proyek dengan tombol "+ Proyek".':'';return}
+ $('#cw').disabled=!weeks[proj.mingguAktif];
+ if(!document.activeElement.closest('#f'))$('#f').innerHTML=FIELDS.map(([k,l,t])=>`<label>${l}<input data-k="${k}" type="${t||'text'}" value="${esc(proj[k])}"></label>`).join('');
+ drawProg();drawLog()}
+function drawProg(){const c=proj.mingguAktif,w=weeks[c]||{},{rows,T}=calc();
+ $('#wk').textContent='Minggu ke-'+c;if(document.activeElement.type!='date'){$('#dr').value=w.dari||'';$('#sp').value=w.sampai||''}
+ sum(T);drawWork();if(document.activeElement?.closest('#tp'))return;
+ const o=(j,x)=>`<td class="r" data-o="${j}">${N(x,4)}</td>`;
+ $('#tp').innerHTML='<tr><th>No</th><th>Uraian</th><th>Sat</th><th>Vol. kontrak</th><th>Bobot %</th><th>Vol. mg lalu</th><th>Vol. mg ini</th><th>Vol. kum.</th><th>Bobot lalu %</th><th>Bobot ini %</th><th>Bobot kum. %</th></tr>'+
+ (rows.length?rows.map(r=>r.tipe=='h'?`<tr class="h"><td>${esc(r.no)}</td><td colspan="10">${esc(r.uraian)}</td></tr>`:
+ `<tr class="${r.err?'bad':''}"><td>${esc(r.no)}</td><td>${esc(r.uraian)}</td><td>${esc(r.sat)}</td><td class="r">${N(r.vol,4)}</td><td class="r">${N(r.bobot,4)}</td><td class="r">${N(r.l,4)}</td><td><input type="number" step="any" inputmode="decimal" data-id="${r.id}" value="${r.i||''}"></td>${o(0,r.k)+o(1,r.bl)+o(2,r.bi)+o(3,r.bk)}</tr>`).join('')+
+ `<tr class="tot"><td colspan="4" class="r">TOTAL</td><td class="r">${N(T.b,4)}</td><td colspan="3"></td><td class="r">${N(T.lalu,4)}</td><td class="r">${N(T.ini,4)}</td><td class="r">${N(T.kum,4)}</td></tr>`
+ :'<tr><td colspan="11">RAB kosong. Pilih "Impor RAB", unggah Excel, lalu simpan.</td></tr>')}
+function drawWork(){const c=proj.mingguAktif,{rows,T}=calc(),d=rows.filter(r=>r.tipe=='i'&&r.i>0).sort((a,b)=>b.bi-a.bi);
+ $('#ws').textContent=`Minggu ke-${c}: progres ${N(T.ini,4)}% (kumulatif ${N(T.kum,4)}%), ${d.length} pekerjaan`;
+ $('#tw').innerHTML=d.length?'<tr><th>No</th><th>Pekerjaan minggu ini</th><th>Sat</th><th>Volume</th><th>Bobot %</th><th>Selesai</th></tr>'+d.map(r=>`<tr><td>${esc(r.no)}</td><td>${esc(r.uraian)}</td><td>${esc(r.sat)}</td><td class="r">${N(r.i,4)}</td><td class="r">${N(r.bi,4)}</td><td class="r">${r.vol?N(r.k/r.vol*100,0)+'%':''}</td></tr>`).join(''):'<tr><td>Belum ada progres minggu ini. Unggah Excel progres atau isi volume manual.</td></tr>'}
+function drawLog(){$('#tl').innerHTML='<tr><th>Minggu</th><th>Periode</th><th>Status</th><th>Lalu %</th><th>Minggu ini %</th><th>Kumulatif %</th><th>Bayar minggu (Rp)</th><th>Kumulatif (Rp)</th></tr>'+
+ history().map(h=>`<tr><td>${h.n}</td><td>${esc(h.w.dari)} s/d ${esc(h.w.sampai)}</td><td>${h.w.status=='closed'?'Ditutup':'Berjalan'}</td><td class="r">${N(h.lalu,4)}</td><td class="r">${N(h.ini,4)}</td><td class="r">${N(h.cum,4)}</td><td class="r">${N(h.bayar,0)}</td><td class="r">${N(h.kumBayar,0)}</td></tr>`).join('')}
+
+/* input volume minggu ini: simpan per-item (field path), tanpa menimpa minggu lain */
+$('#tp').oninput=e=>{const id=e.target.dataset.id,w=weeks[proj?.mingguAktif];if(!id||!w)return;
+ const v=Math.max(0,parseFloat(e.target.value)||0);(w.progress??={})[id]=v;
+ const{rows,T}=calc(),r=rows.find(x=>x.id==id),tr=e.target.closest('tr');tr.className=r.err?'bad':'';
+ [r.k,r.bl,r.bi,r.bk].forEach((x,j)=>tr.querySelector(`[data-o="${j}"]`).textContent=N(x,4));sum(T);drawWork();
+ clearTimeout(tm[id]);tm[id]=setTimeout(()=>updateDoc(wref(),{['progress.'+id]:v}).catch(fail),500)};
+$('#f').oninput=e=>{const k=e.target.dataset.k;if(!k||!proj)return;const v=e.target.type=='number'?+e.target.value||0:e.target.value;
+ clearTimeout(tm[k]);tm[k]=setTimeout(()=>updateDoc(pref(),{[k]:v}).catch(fail),600)};
+['dr','sp'].forEach(i=>$('#'+i).onchange=e=>proj&&updateDoc(wref(),{[i=='dr'?'dari':'sampai']:e.target.value}).catch(fail));
+$('#tabs').onclick=e=>{const v=e.target.dataset.v;if(!v)return;document.querySelectorAll('.tabs button,.view').forEach(x=>x.classList.remove('on'));e.target.classList.add('on');$('#v-'+v).classList.add('on')};
+render();
+</script></body></html>
